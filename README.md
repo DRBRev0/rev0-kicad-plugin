@@ -13,6 +13,16 @@ Au clic :
 2. **Suivi par projet** : le plugin pose une clé `"rev0": {"project_uid": "…"}` dans
    le `.kicad_pro` (une fois pour toutes). Toutes les demandes de revue du même
    projet sont ainsi reliées entre elles dans Rev0.
+   - **Projet partagé ou copié** : l'identifiant appartient au compte qui l'a soumis
+     en premier. Si vous soumettez un projet reçu d'un autre utilisateur (son
+     `.kicad_pro` contient donc *son* identifiant), Rev0 en attribue automatiquement
+     un nouveau et le plugin met à jour votre `.kicad_pro` — votre suivi repart
+     proprement, sans toucher au sien.
+   - **Couper l'héritage** : l'action « **Rev0 — Nouvel identifiant de projet** »
+     (menu des plugins) régénère l'identifiant ; les revues déjà soumises gardent
+     l'ancien groupe, les prochaines démarrent un nouveau suivi. En CLI :
+     `python3 rev0_reset_project.py --project <dossier>` (reset seul) ou
+     `python3 rev0_review.py --project <dossier> --new-project-id` (reset + revue).
 3. **Soumission et retour** : les `*.kicad_sch` du projet sont envoyés à l'API, puis
    la page de la revue s'ouvre dans le navigateur — conversion Zener, pauses
    composants inconnus, questions connecteurs et rapport IA s'y suivent en direct.
@@ -71,7 +81,7 @@ Les jetons se révoquent dans Rev0, page « Revues de design ».
 |---|---|---|
 | `POST` | `/api/v1/plugin/auth/start` | Ouvre une demande d'autorisation (sans auth) |
 | `POST` | `/api/v1/plugin/auth/poll` | Le plugin récupère son jeton une fois la demande approuvée |
-| `POST` | `/api/v1/reviews` | Crée une revue (`name`, `files[]`, `source`, `projectUid`) |
+| `POST` | `/api/v1/reviews` | Crée une revue (`name`, `files[]`, `source`, `projectUid`) — répond `projectUid` (+ `projectUidChanged` si réattribué) |
 | `GET`  | `/api/v1/reviews` | Liste des revues (`?projectUid=` pour un projet) |
 | `GET`  | `/api/v1/reviews/:id` | Avancement d'une revue |
 

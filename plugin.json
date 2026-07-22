@@ -17,6 +17,14 @@
       "entrypoint": "rev0_review.py",
       "icons-light": ["icons/rev0-24.png"],
       "icons-dark": ["icons/rev0-24-dark.png"]
+    },
+    {
+      "identifier": "reset-project",
+      "name": "Rev0 — Nouvel identifiant de projet",
+      "description": "Coupe l'héritage des revues : régénère rev0.project_uid dans le .kicad_pro (les prochaines soumissions démarrent un nouveau groupe de suivi)",
+      "show-button": false,
+      "scopes": ["schematic", "pcb"],
+      "entrypoint": "rev0_reset_project.py"
     }
   ]
 }

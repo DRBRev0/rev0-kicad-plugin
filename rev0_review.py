@@ -248,33 +248,49 @@ def find_project_file(project_dir: Path, project_name: str | None) -> Path | Non
     return candidates[0] if candidates else None
 
 
-def ensure_project_uid(project_dir: Path, project_name: str | None) -> str | None:
-    project_file = find_project_file(project_dir, project_name)
-    if project_file is None:
-        print("Avertissement : aucun .kicad_pro trouvé — revue soumise sans identifiant projet.")
-        return None
+def read_project_file(project_file: Path) -> dict:
     try:
         data = json.loads(project_file.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise Rev0Error(f"Lecture de {project_file.name} impossible : {error}") from error
     if not isinstance(data, dict):
         raise Rev0Error(f"{project_file.name} n'a pas la structure attendue.")
+    return data
 
-    section = data.get("rev0")
-    if isinstance(section, dict) and isinstance(section.get("project_uid"), str):
-        return section["project_uid"]
 
-    uid = str(uuid.uuid4())
-    data.setdefault("rev0", {})
-    if not isinstance(data["rev0"], dict):
+def write_project_uid(project_file: Path, uid: str) -> None:
+    """Pose rev0.project_uid dans le .kicad_pro en préservant tout le reste."""
+    data = read_project_file(project_file)
+    if not isinstance(data.get("rev0"), dict):
         data["rev0"] = {}
     data["rev0"]["project_uid"] = uid
     try:
         project_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     except OSError as error:
         raise Rev0Error(f"Écriture de {project_file.name} impossible : {error}") from error
-    print(f"Identifiant projet créé dans {project_file.name} : {uid}")
-    return uid
+
+
+def ensure_project_uid(
+    project_dir: Path, project_name: str | None, force_new: bool = False
+) -> tuple[str | None, Path | None]:
+    """Identifiant du projet + fichier .kicad_pro. `force_new` coupe
+    l'héritage : un nouvel identifiant remplace l'existant (nouveau groupe de
+    suivi côté Rev0)."""
+    project_file = find_project_file(project_dir, project_name)
+    if project_file is None:
+        print("Avertissement : aucun .kicad_pro trouvé — revue soumise sans identifiant projet.")
+        return None, None
+
+    if not force_new:
+        section = read_project_file(project_file).get("rev0")
+        if isinstance(section, dict) and isinstance(section.get("project_uid"), str):
+            return section["project_uid"], project_file
+
+    uid = str(uuid.uuid4())
+    write_project_uid(project_file, uid)
+    verb = "réinitialisé" if force_new else "créé"
+    print(f"Identifiant projet {verb} dans {project_file.name} : {uid}")
+    return uid, project_file
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +311,12 @@ def collect_schematics(project_dir: Path, project_name: str | None = None) -> li
 
 
 def submit_review(
-    base_url: str, token: str, ctx: KiCadContext, project_dir: Path, name: str
+    base_url: str,
+    token: str,
+    ctx: KiCadContext,
+    project_dir: Path,
+    name: str,
+    project_uid: str | None,
 ) -> dict:
     files = collect_schematics(project_dir, ctx.project_name)
     if not files:
@@ -304,7 +325,6 @@ def submit_review(
             "Enregistrez le schéma avant de lancer la revue."
         )
 
-    project_uid = ensure_project_uid(project_dir, ctx.project_name)
     source_meta = {"plugin": "rev0-kicad", "version": PLUGIN_VERSION, "host": socket.gethostname()}
     if ctx.kicad_version:
         source_meta["kicadVersion"] = ctx.kicad_version
@@ -320,14 +340,17 @@ def submit_review(
     return api_request(base_url, "POST", "/api/v1/reviews", payload, token=token)
 
 
-def run(ctx: KiCadContext, project_dir: Path, name: str) -> str:
+def run(ctx: KiCadContext, project_dir: Path, name: str, new_project_id: bool = False) -> str:
     """Déroulé complet : jeton (login navigateur si besoin), UID projet,
     soumission, ouverture de la revue. Retourne l'URL de la revue."""
     base_url = load_config(ctx)["base_url"]
     token = ensure_token(base_url, ctx, name)
+    project_uid, project_file = ensure_project_uid(
+        project_dir, ctx.project_name, force_new=new_project_id
+    )
 
     try:
-        result = submit_review(base_url, token, ctx, project_dir, name)
+        result = submit_review(base_url, token, ctx, project_dir, name, project_uid)
     except Rev0HttpError as error:
         if error.status != 401:
             raise
@@ -335,7 +358,18 @@ def run(ctx: KiCadContext, project_dir: Path, name: str) -> str:
         save_token(ctx, base_url, None)
         token = browser_login(base_url, ctx, name)
         save_token(ctx, base_url, token)
-        result = submit_review(base_url, token, ctx, project_dir, name)
+        result = submit_review(base_url, token, ctx, project_dir, name, project_uid)
+
+    # Le serveur fait autorité sur l'identifiant : s'il en renvoie un autre
+    # (uid appartenant à un autre compte — projet partagé/copié), le
+    # .kicad_pro est mis à jour pour que le suivi reparte proprement.
+    server_uid = result.get("projectUid")
+    if server_uid and project_uid and server_uid != project_uid and project_file:
+        write_project_uid(project_file, server_uid)
+        print(
+            "Identifiant projet réattribué par Rev0 (projet partagé ?) : "
+            f"{project_file.name} mis à jour → {server_uid}"
+        )
 
     review_url = f"{base_url}{result['url']}"
     print(f"Revue #{result['id']} créée — suivi : {review_url}")
@@ -344,20 +378,19 @@ def run(ctx: KiCadContext, project_dir: Path, name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Retour utilisateur en cas d'erreur : lancé depuis KiCad il n'y a pas de
+# Retour utilisateur hors soumission : lancé depuis KiCad il n'y a pas de
 # console, on ouvre donc une petite page locale dans le navigateur.
 # ---------------------------------------------------------------------------
-def report_error(message: str) -> None:
-    print(f"Rev0 : {message}", file=sys.stderr)
+def open_local_page(title: str, message: str, hint: str = "") -> None:
     if not os.environ.get("KICAD_API_SOCKET"):
         return
     body = (
         "<!doctype html><html lang='fr'><head><meta charset='utf-8'>"
-        "<title>Rev0 — erreur</title></head>"
+        f"<title>{html.escape(title)}</title></head>"
         "<body style='font-family:system-ui;max-width:560px;margin:80px auto;padding:0 24px'>"
-        "<h1 style='font-size:22px'>Rev0 — la revue n'a pas pu partir</h1>"
+        f"<h1 style='font-size:22px'>{html.escape(title)}</h1>"
         f"<p style='white-space:pre-wrap'>{html.escape(message)}</p>"
-        "<p>Corrigez puis recliquez sur « Revue Rev0 » dans KiCad.</p>"
+        f"{f'<p>{html.escape(hint)}</p>' if hint else ''}"
         "</body></html>"
     )
     try:
@@ -370,6 +403,15 @@ def report_error(message: str) -> None:
         pass
 
 
+def report_error(message: str) -> None:
+    print(f"Rev0 : {message}", file=sys.stderr)
+    open_local_page(
+        "Rev0 — la revue n'a pas pu partir",
+        message,
+        "Corrigez puis recliquez sur « Revue Rev0 » dans KiCad.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entrée : bouton KiCad (sans arguments, projet via l'API IPC) ou CLI.
 # ---------------------------------------------------------------------------
@@ -377,6 +419,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Soumettre un projet KiCad en revue Rev0")
     parser.add_argument("--project", default=None, help="Dossier du projet (défaut : projet ouvert dans KiCad)")
     parser.add_argument("--name", default=None, help="Nom de la revue (défaut : nom du projet)")
+    parser.add_argument(
+        "--new-project-id",
+        action="store_true",
+        help="Coupe l'héritage : régénère l'identifiant rev0.project_uid du "
+        ".kicad_pro avant de soumettre (nouveau groupe de suivi dans Rev0)",
+    )
     args = parser.parse_args()
 
     ctx = KiCadContext.connect()
@@ -395,7 +443,7 @@ def main() -> int:
 
     name = args.name or ctx.project_name or project_dir.name
     try:
-        run(ctx, project_dir, name)
+        run(ctx, project_dir, name, new_project_id=args.new_project_id)
     except Rev0Error as error:
         report_error(str(error))
         return 1
