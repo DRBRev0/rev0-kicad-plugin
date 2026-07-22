@@ -1,0 +1,2 @@
+# Bindings officiels de l'API IPC KiCad (installés par KiCad dans le venv du plugin).
+kicad-python>=0.4.0

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "fr.drb-conception.rev0",
+  "name": "Rev0 — Revue de design",
+  "description": "Soumet le projet KiCad ouvert en revue de design Rev0 (DRB Conception) : connexion par navigateur, suivi des demandes par projet, rapport IA dans l'application.",
+  "runtime": {
+    "type": "python",
+    "min_version": "3.9"
+  },
+  "actions": [
+    {
+      "identifier": "review",
+      "name": "Revue Rev0",
+      "description": "Envoyer les schémas du projet ouvert en revue de design Rev0",
+      "show-button": true,
+      "scopes": ["schematic", "pcb"],
+      "entrypoint": "rev0_review.py",
+      "icons-light": ["icons/rev0-24.png"],
+      "icons-dark": ["icons/rev0-24-dark.png"]
+    }
+  ]
+}
