@@ -23,9 +23,18 @@ Au clic :
      l'ancien groupe, les prochaines démarrent un nouveau suivi. En CLI :
      `python3 rev0_reset_project.py --project <dossier>` (reset seul) ou
      `python3 rev0_review.py --project <dossier> --new-project-id` (reset + revue).
-3. **Soumission et retour** : les `*.kicad_sch` du projet sont envoyés à l'API, puis
+3. **Devis avant envoi** : la taille du design (feuilles, composants) est mesurée
+   côté serveur et le prix en crédits s'affiche avant la soumission. Deux voies :
+   **immédiate** (débite votre solde de crédits, remboursé si la revue échoue) ou
+   **file gratuite** (0 crédit, revue lancée à son tour — une seule en attente à la
+   fois). Par défaut le plugin choisit l'immédiate si votre solde couvre, sinon la
+   file gratuite ; forçable avec `--lane credits|free` en CLI.
+4. **Soumission et retour** : les `*.kicad_sch` du projet sont envoyés à l'API, puis
    la page de la revue s'ouvre dans le navigateur — conversion Zener, pauses
    composants inconnus, questions connecteurs et rapport IA s'y suivent en direct.
+   En file gratuite, **gardez cette page ouverte** : elle sert de signe de présence
+   (une coupure courte est tolérée, une absence prolongée retire la revue de la
+   file). Solde et recharge : page `/credits` de l'application.
 
 ## Installation
 
@@ -56,7 +65,7 @@ pause le temps de le qualifier ; les connecteurs demandent vos réponses
 ### En ligne de commande (sans KiCad)
 
 ```bash
-python3 rev0_review.py --project /chemin/du/projet [--name "Ma carte"]
+python3 rev0_review.py --project /chemin/du/projet [--name "Ma carte"] [--lane auto|credits|free]
 ```
 
 Python 3.9+, uniquement la bibliothèque standard (l'API IPC n'est utilisée que

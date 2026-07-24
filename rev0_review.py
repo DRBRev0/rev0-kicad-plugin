@@ -14,9 +14,15 @@ Déroulé d'un clic sur le bouton :
   2. Identifiant projet : une clé  "rev0": {"project_uid": "…"}  est posée
      dans le .kicad_pro (une fois pour toutes) afin de relier entre elles
      les demandes de revue successives du même projet.
-  3. Les .kicad_sch du projet sont envoyés à POST /api/v1/reviews, puis la
+  3. Un devis est demandé à POST /api/v1/reviews/quote (taille mesurée du
+     design → prix en crédits) et la voie est choisie : payante (immédiate)
+     si le solde couvre, sinon file gratuite (lente) si disponible —
+     forçable avec --lane.
+  4. Les .kicad_sch du projet sont envoyés à POST /api/v1/reviews, puis la
      page de la revue s'ouvre dans le navigateur : conversion, questions
-     connecteurs et rapport IA s'y suivent en direct.
+     connecteurs et rapport IA s'y suivent en direct. Pour la file gratuite,
+     cette page ouverte sert de signe de présence : la fermer trop longtemps
+     retire la revue de la file.
 
 Mode ligne de commande (sans KiCad) :
     python3 rev0_review.py --project /chemin/du/projet [--name "Ma carte"]
@@ -43,7 +49,7 @@ import uuid
 import webbrowser
 from pathlib import Path
 
-PLUGIN_VERSION = "2.0.0"
+PLUGIN_VERSION = "2.1.0"
 PLUGIN_IDENTIFIER = "fr.drb-conception.rev0"
 DEFAULT_BASE_URL = "https://rev0.drb-conception.fr"
 LEGACY_CONFIG_PATH = Path.home() / ".rev0" / "config.json"
@@ -168,21 +174,23 @@ def api_request(
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
+        raw = error.read().decode("utf-8", errors="replace")
         try:
-            detail = json.loads(body).get("error", body)
+            body = json.loads(raw)
         except ValueError:
-            detail = body
-        raise Rev0HttpError(error.code, str(detail)) from error
+            body = {}
+        detail = body.get("error", raw) if isinstance(body, dict) else raw
+        raise Rev0HttpError(error.code, str(detail), body if isinstance(body, dict) else {}) from error
     except (urllib.error.URLError, TimeoutError) as error:
         raise Rev0Error(f"Impossible de joindre Rev0 ({base_url}) : {error}") from error
 
 
 class Rev0HttpError(Rev0Error):
-    def __init__(self, status: int, detail: str) -> None:
+    def __init__(self, status: int, detail: str, body: dict | None = None) -> None:
         super().__init__(f"Rev0 a répondu HTTP {status} : {detail}")
         self.status = status
         self.detail = detail
+        self.body = body or {}
 
 
 # ---------------------------------------------------------------------------
@@ -310,21 +318,91 @@ def collect_schematics(project_dir: Path, project_name: str | None = None) -> li
     return [{"name": p.name, "content": p.read_text(encoding="utf-8")} for p in paths]
 
 
+def format_wait(hours: object) -> str:
+    try:
+        value = float(hours)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "inconnue"
+    if value < 1:
+        return f"~{max(5, round(value * 60))} min"
+    return f"~{value:g} h"
+
+
+def choose_lane(base_url: str, token: str, files: list[dict], lane_arg: str) -> str:
+    """Devis AVANT envoi (taille mesurée → prix) puis choix de la voie :
+    payante (immédiate) si le solde couvre, sinon file gratuite (lente).
+    `lane_arg` force une voie ('credits'/'free'), 'auto' laisse décider."""
+    quote = api_request(base_url, "POST", "/api/v1/reviews/quote", {"files": files}, token=token)
+
+    price = quote.get("quote", {})
+    tier = price.get("tier", "?")
+    credits_price = price.get("credits", "?")
+    balance = quote.get("balance", 0)
+    sufficient = bool(quote.get("credits", {}).get("sufficient"))
+    free_lane = quote.get("freeLane", {})
+    free_available = bool(free_lane.get("available"))
+
+    print(
+        f"Devis Rev0 : taille {tier} — {credits_price} crédit(s) "
+        f"({price.get('sheetCount', '?')} feuille(s), {price.get('componentCount', '?')} composant(s)). "
+        f"Solde : {balance}."
+    )
+
+    if quote.get("isAdmin"):
+        return "credits"  # non facturé côté serveur
+
+    if lane_arg == "credits":
+        if not sufficient:
+            raise Rev0Error(
+                f"Solde insuffisant ({balance}/{credits_price} crédits). "
+                f"Rechargez sur {base_url}/credits ou relancez avec --lane free."
+            )
+        return "credits"
+
+    if lane_arg == "free":
+        if not free_available:
+            queued = free_lane.get("queuedReviewId")
+            if queued:
+                raise Rev0Error(
+                    f"Vous avez déjà une revue dans la file gratuite (#{queued}) — une seule à "
+                    f"la fois. Suivi : {base_url}/reviews/{queued}"
+                )
+            raise Rev0Error("La file gratuite est fermée pour le moment.")
+        print(f"File gratuite : attente estimée {format_wait(free_lane.get('estimatedWaitHours'))}.")
+        return "free"
+
+    # auto : payant si couvrable, sinon file gratuite.
+    if sufficient:
+        print(f"Voie immédiate : {credits_price} crédit(s) seront débités (remboursés si échec).")
+        return "credits"
+    if free_available:
+        print(
+            "Solde insuffisant pour la voie immédiate → file gratuite, attente estimée "
+            f"{format_wait(free_lane.get('estimatedWaitHours'))}."
+        )
+        return "free"
+
+    queued = free_lane.get("queuedReviewId")
+    extra = (
+        f" Vous avez déjà une revue dans la file gratuite (#{queued}) : {base_url}/reviews/{queued}."
+        if queued
+        else ""
+    )
+    raise Rev0Error(
+        f"Aucune voie disponible : solde insuffisant ({balance}/{credits_price} crédits) et file "
+        f"gratuite indisponible.{extra} Rechargez sur {base_url}/credits."
+    )
+
+
 def submit_review(
     base_url: str,
     token: str,
     ctx: KiCadContext,
-    project_dir: Path,
+    files: list[dict],
     name: str,
     project_uid: str | None,
+    lane: str,
 ) -> dict:
-    files = collect_schematics(project_dir, ctx.project_name)
-    if not files:
-        raise Rev0Error(
-            f"Aucun fichier .kicad_sch trouvé dans {project_dir}. "
-            "Enregistrez le schéma avant de lancer la revue."
-        )
-
     source_meta = {"plugin": "rev0-kicad", "version": PLUGIN_VERSION, "host": socket.gethostname()}
     if ctx.kicad_version:
         source_meta["kicadVersion"] = ctx.kicad_version
@@ -334,23 +412,58 @@ def submit_review(
         "source": "plugin",
         "sourceMeta": source_meta,
         "files": files,
+        "lane": lane,
     }
     if project_uid:
         payload["projectUid"] = project_uid
     return api_request(base_url, "POST", "/api/v1/reviews", payload, token=token)
 
 
-def run(ctx: KiCadContext, project_dir: Path, name: str, new_project_id: bool = False) -> str:
+def run(
+    ctx: KiCadContext,
+    project_dir: Path,
+    name: str,
+    new_project_id: bool = False,
+    lane_arg: str = "auto",
+) -> str:
     """Déroulé complet : jeton (login navigateur si besoin), UID projet,
-    soumission, ouverture de la revue. Retourne l'URL de la revue."""
+    devis + choix de voie, soumission, ouverture de la revue. Retourne
+    l'URL de la revue."""
     base_url = load_config(ctx)["base_url"]
     token = ensure_token(base_url, ctx, name)
     project_uid, project_file = ensure_project_uid(
         project_dir, ctx.project_name, force_new=new_project_id
     )
 
+    files = collect_schematics(project_dir, ctx.project_name)
+    if not files:
+        raise Rev0Error(
+            f"Aucun fichier .kicad_sch trouvé dans {project_dir}. "
+            "Enregistrez le schéma avant de lancer la revue."
+        )
+
+    def quote_and_submit() -> dict:
+        lane = choose_lane(base_url, token, files, lane_arg)
+        try:
+            return submit_review(base_url, token, ctx, files, name, project_uid, lane)
+        except Rev0HttpError as error:
+            # L'état a pu changer entre devis et envoi : messages actionnables.
+            if error.status == 402:
+                raise Rev0Error(
+                    f"Crédits insuffisants ({error.body.get('balance', '?')}/"
+                    f"{error.body.get('requiredCredits', '?')}). Rechargez sur "
+                    f"{base_url}/credits ou relancez avec --lane free."
+                ) from error
+            if error.status == 409:
+                queued = error.body.get("queuedReviewId")
+                raise Rev0Error(
+                    "Vous avez déjà une revue dans la file gratuite — une seule à la fois."
+                    + (f" Suivi : {base_url}/reviews/{queued}" if queued else "")
+                ) from error
+            raise
+
     try:
-        result = submit_review(base_url, token, ctx, project_dir, name, project_uid)
+        result = quote_and_submit()
     except Rev0HttpError as error:
         if error.status != 401:
             raise
@@ -358,7 +471,7 @@ def run(ctx: KiCadContext, project_dir: Path, name: str, new_project_id: bool = 
         save_token(ctx, base_url, None)
         token = browser_login(base_url, ctx, name)
         save_token(ctx, base_url, token)
-        result = submit_review(base_url, token, ctx, project_dir, name, project_uid)
+        result = quote_and_submit()
 
     # Le serveur fait autorité sur l'identifiant : s'il en renvoie un autre
     # (uid appartenant à un autre compte — projet partagé/copié), le
@@ -372,7 +485,15 @@ def run(ctx: KiCadContext, project_dir: Path, name: str, new_project_id: bool = 
         )
 
     review_url = f"{base_url}{result['url']}"
-    print(f"Revue #{result['id']} créée — suivi : {review_url}")
+    if result.get("status") == "free_queued":
+        print(
+            f"Revue #{result['id']} en file gratuite — suivi : {review_url}\n"
+            "Gardez la page de la revue OUVERTE dans le navigateur : elle sert de signe de "
+            "présence (une absence prolongée retire la revue de la file ; une coupure courte "
+            "est tolérée)."
+        )
+    else:
+        print(f"Revue #{result['id']} créée — suivi : {review_url}")
     webbrowser.open(review_url)
     return review_url
 
@@ -425,6 +546,14 @@ def main() -> int:
         help="Coupe l'héritage : régénère l'identifiant rev0.project_uid du "
         ".kicad_pro avant de soumettre (nouveau groupe de suivi dans Rev0)",
     )
+    parser.add_argument(
+        "--lane",
+        choices=("auto", "credits", "free"),
+        default="auto",
+        help="Voie de soumission : credits (immédiate, débite le solde), free "
+        "(file gratuite lente), auto (défaut : credits si le solde couvre, "
+        "sinon free)",
+    )
     args = parser.parse_args()
 
     ctx = KiCadContext.connect()
@@ -443,7 +572,7 @@ def main() -> int:
 
     name = args.name or ctx.project_name or project_dir.name
     try:
-        run(ctx, project_dir, name, new_project_id=args.new_project_id)
+        run(ctx, project_dir, name, new_project_id=args.new_project_id, lane_arg=args.lane)
     except Rev0Error as error:
         report_error(str(error))
         return 1
